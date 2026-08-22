@@ -2,6 +2,8 @@
 
 An Agent Skill for working with LTspice files: **read, edit, and run**.
 
+GitHub repository: https://github.com/muhammad345ishar/ltspice-agent-skill
+
 ## What this repository provides
 
 - [SKILL.md](/Users/muhammadishar/Projects/Skills/SKILL.md) routing instructions for AI agents.
