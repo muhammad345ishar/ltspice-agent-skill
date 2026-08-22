@@ -23,6 +23,18 @@ except ImportError:
 
 
 KNOWN_KEYS = {"SYMBOL", "SYMATTR", "WIRE", "FLAG", "TEXT"}
+# Approximate pin offsets for stock LTspice primitives, used only when the real
+# lib/sym tree is unavailable.
+#
+# UNVERIFIED: these have NOT been checked against the shipped LTspice symbol
+# library. Real res/cap/voltage symbols are drawn vertically with the origin at
+# the top-left and pins at offsets like (16, 16) and (16, 80), so these centred
+# horizontal offsets are unlikely to be right. Any instance resolved through this
+# table therefore gets a warning attached, because a wrong pin coordinate yields
+# a wrong-but-plausible net assignment -- the worst kind of failure.
+#
+# Fix by pointing --symbol-dir at the LTspice lib/sym tree, or by using
+# LTspice -netlist for authoritative connectivity.
 PRIMITIVE_PIN_OFFSETS = {
     "res": [(-16, 0), (16, 0)],
     "cap": [(-16, 0), (16, 0)],
@@ -137,17 +149,33 @@ class AscDocument:
             block_end = self.symbols[symbol_index + 1].line_index
 
         value_line_index = None
-        insert_at = symbol.line_index + 1
+        last_symattr_index = None
+        last_window_index = None
         for line_index in range(symbol.line_index + 1, block_end):
             line = self.buffer.lines[line_index]
+            # WINDOW records belong to the symbol block and normally sit between
+            # the SYMBOL line and its SYMATTR lines. They must not terminate the
+            # scan, or the existing Value is never found and a duplicate is added.
+            if line.startswith("WINDOW "):
+                last_window_index = line_index
+                continue
             if line.startswith("SYMATTR "):
-                insert_at = line_index + 1
+                last_symattr_index = line_index
                 parts = line.split(None, 2)
-                if len(parts) >= 3 and parts[1] == "Value":
+                if len(parts) >= 2 and parts[1] == "Value":
                     value_line_index = line_index
                     break
-            elif line.startswith(("WINDOW ", "TEXT ", "WIRE ", "FLAG ", "SYMBOL ")):
-                break
+                continue
+            # Any other record type ends this symbol's attribute block.
+            break
+
+        if value_line_index is None:
+            if last_symattr_index is not None:
+                insert_at = last_symattr_index + 1
+            elif last_window_index is not None:
+                insert_at = last_window_index + 1
+            else:
+                insert_at = symbol.line_index + 1
 
         new_line = f"SYMATTR Value {value}"
         if value_line_index is None:
@@ -362,8 +390,14 @@ def _build_symbol_index(symbol_dirs: Iterable[Path]) -> Dict[str, Path]:
 
 def _resolve_symbol_pins(
     symbol: SymbolRecord, symbol_index: Dict[str, Path]
-) -> Tuple[List[Tuple[int, int, int]], List[str]]:
+) -> Tuple[List[Tuple[int, int, int]], List[str], List[str]]:
+    """Return (pins, unresolved, approximate).
+
+    ``approximate`` names instances whose pin coordinates came from the
+    unverified primitive table rather than a real .asy, so the caller can warn.
+    """
     unresolved: List[str] = []
+    approximate: List[str] = []
     normalized = _normalize_symbol_name(symbol.symbol_name)
     candidate = symbol_index.get(normalized)
     if candidate is not None:
@@ -377,21 +411,30 @@ def _resolve_symbol_pins(
                 order = idx + 1
             pins.append((order, pin.x, pin.y))
         if pins:
-            return pins, unresolved
+            return pins, unresolved, approximate
         unresolved.append(
             f"{symbol.symattrs.get('InstName', symbol.symbol_name)}: symbol resolved but no pins in {candidate}"
         )
-        return [], unresolved
+        return [], unresolved, approximate
 
     primitive = normalized.split("/")[-1]
     offsets = PRIMITIVE_PIN_OFFSETS.get(primitive)
     if offsets:
-        return [(idx + 1, x, y) for idx, (x, y) in enumerate(offsets)], unresolved
+        inst = symbol.symattrs.get("InstName", symbol.symbol_name)
+        approximate.append(
+            f"{inst} ('{symbol.symbol_name}'): pin coordinates came from the "
+            "unverified primitive table, not a real .asy -- its connectivity is a guess"
+        )
+        return (
+            [(idx + 1, x, y) for idx, (x, y) in enumerate(offsets)],
+            unresolved,
+            approximate,
+        )
 
     unresolved.append(
         f"{symbol.symattrs.get('InstName', symbol.symbol_name)}: unresolved symbol pins for '{symbol.symbol_name}'"
     )
-    return [], unresolved
+    return [], unresolved, approximate
 
 
 def _build_geometric_netlist(
@@ -437,9 +480,13 @@ def _build_geometric_netlist(
 
     component_nets: List[Tuple[SymbolRecord, List[Tuple[int, int]]]] = []
     unresolved: List[str] = []
+    approximate: List[str] = []
     for symbol in doc.symbols:
-        pin_offsets, pin_unresolved = _resolve_symbol_pins(symbol, symbol_index)
+        pin_offsets, pin_unresolved, pin_approximate = _resolve_symbol_pins(
+            symbol, symbol_index
+        )
         unresolved.extend(pin_unresolved)
+        approximate.extend(pin_approximate)
         pin_nodes: List[Tuple[int, int]] = []
         for order, dx, dy in sorted(pin_offsets, key=lambda item: item[0]):
             tx, ty = _transform_offset(dx, dy, symbol.rotation)
@@ -477,6 +524,7 @@ def _build_geometric_netlist(
         return root_name[root]
 
     lines: List[str] = []
+    emitted: List[Tuple[str, List[str]]] = []
     for idx, (symbol, pin_nodes) in enumerate(component_nets, start=1):
         inst_name = symbol.symattrs.get("InstName", f"X{idx}")
         value = symbol.symattrs.get("Value", symbol.symbol_name)
@@ -486,11 +534,45 @@ def _build_geometric_netlist(
         nets = [net_name(node) for node in pin_nodes_sorted]
         line = f"{inst_name} {' '.join(nets)} {value}"
         lines.append(line)
+        emitted.append((inst_name, nets))
+
+    warnings: List[str] = list(approximate)
+
+    # Sanity check: a component sharing no net with any other component is
+    # almost always a geometry failure (pin coordinates landing off the wire
+    # endpoints), not a real circuit. Without this the fallback happily reports
+    # a confident netlist in which nothing is connected to anything.
+    net_users: Dict[str, int] = {}
+    for _inst, nets in emitted:
+        for net in set(nets):
+            net_users[net] = net_users.get(net, 0) + 1
+
+    isolated = [
+        inst
+        for inst, nets in emitted
+        if all(net_users.get(net, 0) < 2 for net in set(nets))
+    ]
+    if emitted and len(isolated) == len(emitted):
+        warnings.append(
+            "GEOMETRY FAILURE: no component shares a net with any other component. "
+            "Every pin landed on its own node, so this netlist describes a fully "
+            "disconnected circuit and must not be reported as the circuit's "
+            "connectivity. Likely cause: pin offsets do not match the symbols "
+            "actually used. Supply the LTspice lib/sym tree via --symbol-dir, or "
+            "use LTspice -netlist."
+        )
+    elif isolated:
+        warnings.append(
+            "Components connected to nothing else: "
+            + ", ".join(sorted(isolated))
+            + ". Verify their pin coordinates before trusting these nets."
+        )
 
     return {
         "mode": "geometric-fallback",
         "netlist": "\n".join(lines),
         "unresolved": sorted(set(unresolved)),
+        "warnings": warnings,
     }
 
 
@@ -545,7 +627,9 @@ def build_netlist(
             warnings.append("No LTspice binary found; using geometric fallback.")
 
     fallback = _build_geometric_netlist(doc, symbol_dirs=symbol_dirs)
-    fallback["warnings"] = warnings
+    # Extend rather than replace: the fallback reports its own warnings about
+    # approximate pin data and disconnected components.
+    fallback["warnings"] = warnings + list(fallback.get("warnings", []))
     return fallback
 
 
