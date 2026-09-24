@@ -76,3 +76,32 @@ def write_ltspice_text(buffer: TextFileBuffer, output_path: Optional[str] = None
     target = Path(output_path) if output_path else buffer.path
     target.write_bytes(buffer.to_bytes())
     return target
+
+
+def new_ltspice_buffer(
+    path: str,
+    lines: Optional[List[str]] = None,
+    encoding: str = "utf-8",
+    newline: str = "\r\n",
+    bom: Optional[bytes] = None,
+) -> TextFileBuffer:
+    """Build a TextFileBuffer for a brand-new file (nothing on disk yet).
+
+    Defaults match what LTspice itself writes on Windows: CRLF line endings and,
+    for ASCII content, bytes identical under utf-8 or cp1252. ``raw`` is left
+    empty because there is no original byte image to preserve.
+    """
+    lines = list(lines) if lines is not None else []
+    if bom is None:
+        bom = b"\xff\xfe" if encoding == "utf-16le" else b""
+    text = newline.join(lines)
+    return TextFileBuffer(
+        path=Path(path),
+        raw=b"",
+        text=text,
+        encoding=encoding,
+        bom=bom,
+        newline=newline,
+        lines=lines,
+        has_trailing_newline=True,
+    )

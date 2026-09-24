@@ -1,8 +1,9 @@
 # ltspice Agent Skill
 
-An Agent Skill that lets an AI **read, edit, and run** LTspice files — schematics
-(`.asc`), symbols (`.asy`), waveforms (`.raw`), logs (`.log`) and netlists
-(`.net`).
+An Agent Skill that lets an AI **read, edit, create, and run** LTspice files —
+schematics (`.asc`), symbols (`.asy`), waveforms (`.raw`), logs (`.log`) and
+netlists (`.net`). It edits existing schematics without disturbing their bytes, and
+builds new ones from scratch record by record.
 
 Pure Python standard library, no dependencies. Python 3.8+.
 
@@ -27,7 +28,7 @@ edits are semantic rather than positional.
 
 - [SKILL.md](SKILL.md) — routing instructions the agent reads.
 - [scripts/](scripts) — the implementation:
-  - [ltspice_asc.py](scripts/ltspice_asc.py) — parse, summarise, edit and netlist `.asc`
+  - [ltspice_asc.py](scripts/ltspice_asc.py) — parse, summarise, edit, build and netlist `.asc`
   - [ltspice_asy.py](scripts/ltspice_asy.py) — parse and write `.asy` symbols
   - [ltspice_raw.py](scripts/ltspice_raw.py) — parse and CSV-export `.raw` waveforms
   - [ltspice_log.py](scripts/ltspice_log.py) — parse `.log` measurements and errors
@@ -39,10 +40,12 @@ edits are semantic rather than positional.
   [raw](reference/raw-format.md) ·
   [log](reference/log-format.md) ·
   [SPICE dialect](reference/spice-dialect.md) ·
+  [authoring a new .asc](reference/authoring-asc.md) ·
   [CLI](reference/cli-automation.md)
 - Test harnesses:
   [mutation_gate.py](scripts/mutation_gate.py) ·
   [roundtrip_harness.py](scripts/roundtrip_harness.py) ·
+  [build_selftest.py](scripts/build_selftest.py) ·
   [raw_selftest.py](scripts/raw_selftest.py) ·
   [log_selftest.py](scripts/log_selftest.py) ·
   [netlist_selftest.py](scripts/netlist_selftest.py) ·
@@ -50,7 +53,12 @@ edits are semantic rather than positional.
 
 ## Install
 
-Clone into wherever your agent looks for skills:
+**Step-by-step, per-platform instructions live in [INSTALL.md](INSTALL.md)** —
+Claude (desktop/web/Code), ChatGPT / OpenAI, Google Gemini, agentic coding tools
+(Copilot, Cursor, Windsurf, Codex), and a universal fallback for any AI that can run
+Python and read files.
+
+The short version — clone into wherever your agent looks for skills:
 
 ```bash
 git clone https://github.com/muhammad345ishar/ltspice-agent-skill.git ltspice
@@ -69,6 +77,14 @@ python scripts/ltspice_asc.py summary path/to/circuit.asc
 # edit it — one line changes, encoding preserved
 python scripts/ltspice_asc.py set-value path/to/circuit.asc R1 10k --output out.asc
 python scripts/ltspice_asc.py add-directive path/to/circuit.asc ".tran 10m" --output out.asc
+
+# build a new one from scratch — each command appends one valid record
+python scripts/ltspice_asc.py new circuit.asc
+python scripts/ltspice_asc.py add-symbol circuit.asc res 160 96 --inst R1 --value 10k
+python scripts/ltspice_asc.py add-wire   circuit.asc 176 96 176 160
+python scripts/ltspice_asc.py add-flag   circuit.asc 176 160 0
+python scripts/ltspice_asc.py add-directive circuit.asc ".tran 10m"
+# see reference/authoring-asc.md for coordinates, the 16-unit grid and verifying connectivity
 
 # connectivity
 python scripts/ltspice_asc.py netlist path/to/circuit.asc          # uses LTspice if present
@@ -119,8 +135,15 @@ corpus — they run straight from a fresh clone:
 python scripts/raw_selftest.py      # 154 checks
 python scripts/log_selftest.py      #  42 checks
 python scripts/netlist_selftest.py  #  13 checks
+python scripts/build_selftest.py    #  23 checks — builds a schematic from scratch
 python scripts/mutation_gate.py examples/skill_samples
 ```
+
+`build_selftest.py` is the ground truth for creating files from nothing: it emits a
+byte-clean header, appends symbols/wires/flags with the builder commands, and then
+rebuilds the `connected_ladder` circuit from scratch and asserts its netlist against
+the shipped `my_resistor.asy` — whose pin geometry is known exactly, so the wiring is
+checked for real rather than against a self-consistent guess.
 
 The shipped samples under [examples/skill_samples/](examples/skill_samples) are
 deliberately chosen to carry the traps that broke earlier versions:

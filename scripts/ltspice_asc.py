@@ -12,9 +12,19 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
-    from .ltspice_common import TextFileBuffer, read_ltspice_text, write_ltspice_text
+    from .ltspice_common import (
+        TextFileBuffer,
+        new_ltspice_buffer,
+        read_ltspice_text,
+        write_ltspice_text,
+    )
 except ImportError:
-    from ltspice_common import TextFileBuffer, read_ltspice_text, write_ltspice_text
+    from ltspice_common import (
+        TextFileBuffer,
+        new_ltspice_buffer,
+        read_ltspice_text,
+        write_ltspice_text,
+    )
 
 try:
     from .ltspice_asy import parse_asy
@@ -23,6 +33,9 @@ except ImportError:
 
 
 KNOWN_KEYS = {"SYMBOL", "SYMATTR", "WIRE", "FLAG", "TEXT"}
+# Rotation/mirror codes LTspice accepts on a SYMBOL line. R = rotate clockwise,
+# M = mirror-then-rotate. See reference/authoring-asc.md for the transform.
+VALID_ROTATIONS = {"R0", "R90", "R180", "R270", "M0", "M90", "M180", "M270"}
 # Approximate pin offsets for stock LTspice primitives, used only when the real
 # lib/sym tree is unavailable.
 #
@@ -194,6 +207,47 @@ class AscDocument:
         self._reparse()
         return len(self.buffer.lines) - 1
 
+    def add_symbol(
+        self,
+        symbol_name: str,
+        x: int,
+        y: int,
+        rotation: str = "R0",
+        inst_name: Optional[str] = None,
+        value: Optional[str] = None,
+        attrs: Optional[Iterable[Tuple[str, str]]] = None,
+    ) -> int:
+        """Append a SYMBOL block. WINDOW records are omitted deliberately —
+        LTspice regenerates them at their default positions when it opens the
+        file, so a minimal block (SYMBOL + SYMATTR lines) is valid and complete.
+        """
+        if rotation not in VALID_ROTATIONS:
+            raise ValueError(
+                f"Invalid rotation '{rotation}'. Use one of {sorted(VALID_ROTATIONS)}"
+            )
+        new_lines = [f"SYMBOL {symbol_name} {int(x)} {int(y)} {rotation}"]
+        if inst_name is not None:
+            new_lines.append(f"SYMATTR InstName {inst_name}")
+        if value is not None:
+            new_lines.append(f"SYMATTR Value {value}")
+        for key, val in attrs or []:
+            new_lines.append(f"SYMATTR {key} {val}")
+        insert_at = len(self.buffer.lines)
+        self.buffer.lines.extend(new_lines)
+        self._reparse()
+        return insert_at
+
+    def add_wire(self, x1: int, y1: int, x2: int, y2: int) -> int:
+        self.buffer.lines.append(f"WIRE {int(x1)} {int(y1)} {int(x2)} {int(y2)}")
+        self._reparse()
+        return len(self.buffer.lines) - 1
+
+    def add_flag(self, x: int, y: int, label: str) -> int:
+        """Add a net label. Label ``0`` is ground."""
+        self.buffer.lines.append(f"FLAG {int(x)} {int(y)} {label}")
+        self._reparse()
+        return len(self.buffer.lines) - 1
+
     def remove_directive(self, directive_prefix: str) -> int:
         for idx, directive in enumerate(self.directives):
             if directive["body"].startswith(directive_prefix):
@@ -348,6 +402,24 @@ def parse_asc(path: str) -> AscDocument:
 
 def write_asc(doc: AscDocument, output_path: Optional[str] = None) -> Path:
     return write_ltspice_text(doc.buffer, output_path)
+
+
+def new_document(
+    path: str,
+    sheet_w: int = 880,
+    sheet_h: int = 680,
+    encoding: str = "utf-8",
+    newline: str = "\r\n",
+) -> AscDocument:
+    """Create an empty but valid schematic (``Version 4`` + ``SHEET`` header).
+
+    Defaults produce a file byte-for-byte in the style LTspice writes: CRLF
+    endings and ASCII content. Prefer ASCII SI prefixes (``u`` for micro, not
+    ``µ``) so the file stays encoding-clean; see reference/spice-dialect.md.
+    """
+    header = ["Version 4", f"SHEET 1 {int(sheet_w)} {int(sheet_h)}"]
+    buffer = new_ltspice_buffer(path, lines=header, encoding=encoding, newline=newline)
+    return parse_asc_from_buffer(buffer)
 
 
 def _rotate(x: int, y: int, deg: int) -> Tuple[int, int]:
@@ -668,6 +740,51 @@ def main() -> None:
     add_dir.add_argument("--size", type=int, default=2)
     add_dir.add_argument("--output")
 
+    new_p = sub.add_parser("new", help="Create a new empty schematic (Version 4 + SHEET)")
+    new_p.add_argument("output")
+    new_p.add_argument("--sheet-w", type=int, default=880)
+    new_p.add_argument("--sheet-h", type=int, default=680)
+    new_p.add_argument(
+        "--encoding", default="utf-8", choices=["utf-8", "cp1252", "utf-16le"]
+    )
+    new_p.add_argument("--newline", default="crlf", choices=["crlf", "lf"])
+    new_p.add_argument("--force", action="store_true", help="Overwrite if the file exists")
+
+    add_sym = sub.add_parser("add-symbol", help="Append a SYMBOL block")
+    add_sym.add_argument("path")
+    add_sym.add_argument("symbol_name")
+    add_sym.add_argument("x", type=int)
+    add_sym.add_argument("y", type=int)
+    add_sym.add_argument("--rotation", default="R0")
+    add_sym.add_argument("--inst", help="SYMATTR InstName (e.g. R1, C1, V1)")
+    add_sym.add_argument("--value", help="SYMATTR Value (e.g. 10k, 100n, SINE(0 1 1k))")
+    add_sym.add_argument(
+        "--attr",
+        action="append",
+        nargs=2,
+        metavar=("KEY", "VALUE"),
+        default=[],
+        help="Extra SYMATTR, e.g. --attr SpiceLine Rser=1 (repeatable)",
+    )
+    add_sym.add_argument("--output")
+
+    add_wire = sub.add_parser("add-wire", help="Append a WIRE record")
+    add_wire.add_argument("path")
+    add_wire.add_argument("x1", type=int)
+    add_wire.add_argument("y1", type=int)
+    add_wire.add_argument("x2", type=int)
+    add_wire.add_argument("y2", type=int)
+    add_wire.add_argument("--output")
+
+    add_flag_p = sub.add_parser(
+        "add-flag", help="Append a FLAG net label ('0' is ground)"
+    )
+    add_flag_p.add_argument("path")
+    add_flag_p.add_argument("x", type=int)
+    add_flag_p.add_argument("y", type=int)
+    add_flag_p.add_argument("label")
+    add_flag_p.add_argument("--output")
+
     rm_dir = sub.add_parser("remove-directive", help="Remove first directive by prefix")
     rm_dir.add_argument("path")
     rm_dir.add_argument("prefix")
@@ -702,6 +819,53 @@ def main() -> None:
     if args.cmd == "add-directive":
         doc = parse_asc(args.path)
         doc.add_directive(args.directive, args.x, args.y, args.size)
+        output = write_asc(doc, args.output)
+        print(output)
+        return
+
+    if args.cmd == "new":
+        target = Path(args.output)
+        if target.exists() and not args.force:
+            raise SystemExit(
+                f"Refusing to overwrite existing file: {target} (use --force)"
+            )
+        newline = "\r\n" if args.newline == "crlf" else "\n"
+        doc = new_document(
+            args.output,
+            sheet_w=args.sheet_w,
+            sheet_h=args.sheet_h,
+            encoding=args.encoding,
+            newline=newline,
+        )
+        output = write_asc(doc, args.output)
+        print(output)
+        return
+
+    if args.cmd == "add-symbol":
+        doc = parse_asc(args.path)
+        doc.add_symbol(
+            args.symbol_name,
+            args.x,
+            args.y,
+            rotation=args.rotation,
+            inst_name=args.inst,
+            value=args.value,
+            attrs=args.attr,
+        )
+        output = write_asc(doc, args.output)
+        print(output)
+        return
+
+    if args.cmd == "add-wire":
+        doc = parse_asc(args.path)
+        doc.add_wire(args.x1, args.y1, args.x2, args.y2)
+        output = write_asc(doc, args.output)
+        print(output)
+        return
+
+    if args.cmd == "add-flag":
+        doc = parse_asc(args.path)
+        doc.add_flag(args.x, args.y, args.label)
         output = write_asc(doc, args.output)
         print(output)
         return
